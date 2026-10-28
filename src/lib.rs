@@ -125,6 +125,13 @@ pub struct Config {
     /// via DNS64. [`Config::allow_flow`] still sees the guest's IPv4
     /// destination.
     pub nat64_prefix: Option<Ipv6Addr>,
+    /// Give the guest IPv6: [`netdev::configure`] adds `guest6`, a
+    /// default route via `gateway6` and its neighbor entry only when
+    /// set. Clear it when the host has no IPv6 default route it can use
+    /// ([`netdev::host_has_ipv6_default_route`]): a guest with an IPv6
+    /// route prefers IPv6 addresses (RFC 6724) and tries them first,
+    /// while the host's connects to them fail.
+    pub ipv6: bool,
 }
 
 impl Config {
@@ -157,6 +164,7 @@ impl Default for Config {
             buffers: 96,
             allow_flow: None,
             nat64_prefix: None,
+            ipv6: true,
         }
     }
 }
