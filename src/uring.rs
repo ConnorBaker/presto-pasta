@@ -535,9 +535,17 @@ impl EventLoop {
                 } else {
                     std::net::Ipv6Addr::UNSPECIFIED.into()
                 };
-                let sock = UdpSocket::bind(SocketAddr::new(bind_ip, 0)).ok()?;
-                sock.connect(target).ok()?;
-                sock
+                let sock = UdpSocket::bind(SocketAddr::new(bind_ip, 0))
+                    .and_then(|sock| sock.connect(target).map(|()| sock));
+                match sock {
+                    Ok(sock) => sock,
+                    Err(e) => {
+                        if let Some(codes) = e.raw_os_error().and_then(unreachable_codes) {
+                            self.unreachable_no_flow(key, codes, Quote::Udp);
+                        }
+                        return None;
+                    }
+                }
             }
             flow::FlowKind::Ping => {
                 // Requires net.ipv4.ping_group_range to cover our gid;
@@ -797,62 +805,99 @@ impl EventLoop {
     /// Translate a host socket error on a UDP flow (delivered by ICMP
     /// to the connected socket) into an ICMP/ICMPv6 destination
     /// unreachable towards the guest, so guest sockets see e.g.
-    /// ECONNREFUSED for closed ports just like on a kernel path. The
-    /// embedded offending packet is reconstructed from the flow key
-    /// (the original datagram is gone by the time the error surfaces),
-    /// which is enough for the guest kernel to match it to the socket.
+    /// ECONNREFUSED for closed ports just like on a kernel path.
     fn udp_error_to_guest(&mut self, id: usize, errno: i32) {
-        // v4 / v6 code per RFC 792 and RFC 4443.
-        let (code4, code6) = match errno {
-            libc::ECONNREFUSED => (3, 4), // port unreachable
-            libc::EHOSTUNREACH => (1, 3), // host / address unreachable
-            libc::ENETUNREACH => (0, 0),  // net unreachable / no route
-            _ => return,
+        let Some(codes) = unreachable_codes(errno) else {
+            return;
         };
         let Some(f) = self.flows.get_mut(id) else {
             return;
         };
         f.last_active = Instant::now();
-        let key = f.key;
-        let buf_id = f.buf;
+        let (key, buf_id) = (f.key, f.buf);
+        self.unreachable_to_guest(buf_id, key, codes, Quote::Udp);
+    }
+
+    /// Answer a guest packet that got no flow because its host socket
+    /// failed: the ICMP message is built in a buffer borrowed for the
+    /// call. With the pool dry nothing is sent, as for a new flow.
+    fn unreachable_no_flow(&mut self, key: flow::FlowKey, codes: (u8, u8), quote: Quote) {
+        let Some(buf_id) = self.pool.alloc() else {
+            return;
+        };
+        self.unreachable_to_guest(buf_id, key, codes, quote);
+        self.pool.free(buf_id);
+    }
+
+    /// Write an ICMP/ICMPv6 destination unreachable with `codes`
+    /// (v4, v6) for the guest's packet towards `key.dst` to the guest,
+    /// built in `buf_id`. The embedded offending packet is
+    /// reconstructed from the flow key and `quote` (the original is
+    /// gone by the time a socket error surfaces), which is enough for
+    /// the guest kernel to match it to the socket.
+    fn unreachable_to_guest(
+        &mut self,
+        buf_id: buf::BufId,
+        key: flow::FlowKey,
+        (code4, code6): (u8, u8),
+        quote: Quote,
+    ) {
+        // RFC 1122 3.2.2: no ICMP error about a datagram to a multicast
+        // or broadcast address.
+        if multicast_or_broadcast(key.dst.ip()) {
+            return;
+        }
         let (guest4, guest6) = (self.cfg.guest4, self.cfg.guest6);
-        let udp_len = u16::try_from(proto::UDP_HDR_LEN).expect("header length");
+        let (l4_proto, l4_len) = match quote {
+            Quote::Udp => (proto::IPPROTO_UDP, proto::UDP_HDR_LEN),
+            Quote::TcpSyn(_) => (proto::IPPROTO_TCP, proto::TCP_HDR_LEN),
+        };
+        let quoted_len = u16::try_from(l4_len).expect("header length");
 
         // ICMP message layout: 8-byte unreachable header, then the
-        // reconstructed IP + UDP header of the guest's datagram.
+        // reconstructed IP + L4 header of the guest's packet.
         let l4_start = buf::HEADROOM;
         let embedded = l4_start + proto::ICMP_HDR_LEN;
         let b = self.pool.get_mut(buf_id);
         let (ip_len, ip_proto, icmp_type, code, embedded_pseudo) = match key.dst.ip() {
             IpAddr::V4(dst) => {
-                proto::Ipv4Hdr::write(&mut b[embedded..], guest4, dst, proto::IPPROTO_UDP, udp_len);
+                proto::Ipv4Hdr::write(&mut b[embedded..], guest4, dst, l4_proto, quoted_len);
                 (
                     proto::IPV4_HDR_LEN,
                     proto::IPPROTO_ICMP,
                     proto::ICMP_DEST_UNREACH,
                     code4,
-                    proto::pseudo_v4(guest4, dst, proto::IPPROTO_UDP, udp_len),
+                    proto::pseudo_v4(guest4, dst, l4_proto, quoted_len),
                 )
             }
             IpAddr::V6(dst) => {
-                proto::Ipv6Hdr::write(&mut b[embedded..], guest6, dst, proto::IPPROTO_UDP, udp_len);
+                proto::Ipv6Hdr::write(&mut b[embedded..], guest6, dst, l4_proto, quoted_len);
                 (
                     proto::IPV6_HDR_LEN,
                     proto::IPPROTO_ICMPV6,
                     proto::ICMPV6_DEST_UNREACH,
                     code6,
-                    proto::pseudo_v6(guest6, dst, proto::IPPROTO_UDP, udp_len),
+                    proto::pseudo_v6(guest6, dst, l4_proto, quoted_len),
                 )
             }
         };
-        let end = embedded + ip_len + proto::UDP_HDR_LEN;
-        proto::UdpHdr::write(
-            &mut b[end - proto::UDP_HDR_LEN..end],
-            key.guest_port,
-            key.dst.port(),
-            embedded_pseudo,
-            false,
-        );
+        let end = embedded + ip_len + l4_len;
+        let ports = (key.guest_port, key.dst.port());
+        let quoted = &mut b[end - l4_len..end];
+        match quote {
+            Quote::Udp => proto::UdpHdr::write(quoted, ports.0, ports.1, embedded_pseudo, false),
+            Quote::TcpSyn(seq) => proto::TcpHdr::write(
+                quoted,
+                ports,
+                seq,
+                0,
+                proto::TCP_SYN,
+                0,
+                &[],
+                embedded_pseudo,
+                false,
+            ),
+        }
         // ICMPv4 checksums have no pseudo-header.
         let pseudo = match key.dst.ip() {
             IpAddr::V4(_) => 0,
@@ -892,6 +937,13 @@ impl EventLoop {
     /// its outcome; the SYN-ACK is only sent once the host connection
     /// is established, so connection refusal maps to RST.
     fn new_tcp_flow(&mut self, key: flow::FlowKey, syn: &proto::TcpHdr) -> Option<usize> {
+        // RFC 1122 4.2.3.10: silently discard a SYN to a multicast or
+        // broadcast address, before the flow policy is asked or a host
+        // socket made. pasta's tcp_conn_from_tap discards these too, and
+        // SYNs with an unspecified address or port 0 at either end.
+        if multicast_or_broadcast(key.dst.ip()) {
+            return None;
+        }
         if !self.flow_allowed(&key) {
             return None; // no SYN-ACK; the guest times out
         }
@@ -903,13 +955,18 @@ impl EventLoop {
         } else {
             AddressFamily::INET6
         };
-        let sock = socket_with(
+        let sock = match socket_with(
             family,
             SocketType::STREAM,
             SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
             Some(ipproto::TCP),
-        )
-        .ok()?;
+        ) {
+            Ok(sock) => sock,
+            Err(e) => {
+                self.tcp_refuse_syn(key, syn, e.raw_os_error());
+                return None;
+            }
+        };
         // The window we advertise to the guest is the free space in the
         // send buffer; the kernel default (~200 KiB, and fixed once we
         // read it) caps upload throughput at window/loop-latency, so
@@ -917,7 +974,10 @@ impl EventLoop {
         let _ = sockopt::set_socket_send_buffer_size(&sock, 4 * 1024 * 1024);
         match connect(&sock, &target) {
             Ok(()) | Err(Errno::INPROGRESS) => {}
-            Err(_) => return None, // no SYN-ACK; the guest times out
+            Err(e) => {
+                self.tcp_refuse_syn(key, syn, e.raw_os_error());
+                return None;
+            }
         }
         let sndbuf = sockopt::socket_send_buffer_size(&sock)
             .ok()
@@ -995,7 +1055,7 @@ impl EventLoop {
         match state {
             flow::TcpState::Connecting => {
                 if events & (POLL_ERR | POLL_HUP) != 0 || sock_err != 0 {
-                    self.tcp_reset(id);
+                    self.tcp_connect_failed(id, sock_err);
                     return;
                 }
                 if let Some(t) = self.flows.get_mut(id).and_then(|f| f.tcp.as_mut()) {
@@ -1513,6 +1573,40 @@ impl EventLoop {
         self.remove_flow(id);
     }
 
+    /// Answer a guest SYN that got no flow because the host socket or
+    /// connect failed with `errno` at once (e.g. no route): staying
+    /// silent would leave the guest retransmitting its SYN for minutes,
+    /// unless the failure passes (see [`syn_answer`]).
+    fn tcp_refuse_syn(&mut self, key: flow::FlowKey, syn: &proto::TcpHdr, errno: i32) {
+        match syn_answer(errno) {
+            SynAnswer::Unreachable(codes) => {
+                self.unreachable_no_flow(key, codes, Quote::TcpSyn(syn.seq));
+            }
+            SynAnswer::Reset => self.send_tcp_rst_no_flow(key.dst.ip(), syn, 0),
+            SynAnswer::Retransmit => {}
+        }
+    }
+
+    /// Abort a flow whose host connect failed asynchronously with
+    /// `errno` (0 when the socket reported none): ICMP unreachable as
+    /// in [`Self::tcp_refuse_syn`], else an RST.
+    fn tcp_connect_failed(&mut self, id: usize, errno: i32) {
+        let Some(f) = self.flows.get_by_id(id) else {
+            return;
+        };
+        let (key, buf_id) = (f.key, f.buf);
+        let syn_seq = f.tcp.as_ref().map(|t| t.seq_from_guest.wrapping_sub(1));
+        match (syn_answer(errno), syn_seq) {
+            (SynAnswer::Unreachable(codes), Some(seq)) => {
+                // Nothing is buffered while connecting; the flow's
+                // buffer is free for the message.
+                self.unreachable_to_guest(buf_id, key, codes, Quote::TcpSyn(seq));
+                self.remove_flow(id);
+            }
+            _ => self.tcp_reset(id),
+        }
+    }
+
     /// Drop the flow once both directions are closed and acknowledged.
     fn tcp_maybe_close(&mut self, id: usize) {
         if self
@@ -1629,6 +1723,83 @@ impl EventLoop {
     }
 }
 
+/// ICMP/ICMPv6 destination unreachable codes (v4, v6) for a host
+/// socket error, per RFC 792 and RFC 4443, chosen so that the guest's
+/// socket fails with the same errno (Linux: `icmp_err_convert` in
+/// net/ipv4/icmp.c, `icmpv6_err_convert` in net/ipv6/icmp.c); `None`
+/// for other errors.
+fn unreachable_codes(errno: i32) -> Option<(u8, u8)> {
+    match errno {
+        libc::ECONNREFUSED => Some((3, 4)), // port unreachable
+        libc::EHOSTUNREACH => Some((1, 3)), // host / address unreachable
+        // net unreachable / no route; a host without the address
+        // family has no route to it either
+        libc::ENETUNREACH | libc::EAFNOSUPPORT => Some((0, 0)),
+        // A firewall or LSM refused it, or (UDP) the destination is a
+        // broadcast address on the host, which needs SO_BROADCAST
+        // (__ip4_datagram_connect): communication administratively
+        // prohibited (RFC 1812 5.2.7.1, RFC 4443 3.1). IPv6 guests see
+        // EACCES; no ICMPv4 code gives EACCES on Linux, so IPv4 guests
+        // see EHOSTUNREACH.
+        libc::EACCES | libc::EPERM => Some((13, 1)),
+        _ => None,
+    }
+}
+
+/// Whether `ip` is a multicast or the limited broadcast address (the
+/// guest's addresses are host-width, so it has no subnet broadcast),
+/// IPv4-mapped ones included.
+fn multicast_or_broadcast(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_multicast() || v4.is_broadcast(),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or_else(|| v6.is_multicast(), |v4| multicast_or_broadcast(v4.into())),
+    }
+}
+
+/// How a guest SYN is answered when the host socket or connect failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SynAnswer {
+    /// ICMP/ICMPv6 destination unreachable with these (v4, v6) codes,
+    /// so the guest's connect fails with the errno a native one would.
+    Unreachable((u8, u8)),
+    /// RST: TCP's own answer to a refused connection, and the fallback
+    /// for errors no ICMP code describes.
+    Reset,
+    /// Nothing: the host is short of fds, memory, buffers or local
+    /// ports (or, for IPv6, has no usable source address yet, as during
+    /// duplicate address detection), which passes; the guest's SYN
+    /// retransmit retries.
+    Retransmit,
+}
+
+/// The answer to a guest SYN whose host `socket` or `connect` failed
+/// with `errno`.
+fn syn_answer(errno: i32) -> SynAnswer {
+    match errno {
+        libc::EMFILE
+        | libc::ENFILE
+        | libc::ENOBUFS
+        | libc::ENOMEM
+        | libc::EAGAIN
+        | libc::EADDRNOTAVAIL => SynAnswer::Retransmit,
+        libc::ECONNREFUSED => SynAnswer::Reset,
+        e => unreachable_codes(e).map_or(SynAnswer::Reset, SynAnswer::Unreachable),
+    }
+}
+
+/// Transport header of the guest's packet quoted in an ICMP error. The
+/// guest kernel matches the error to its socket by addresses and
+/// ports, and for TCP only accepts it if the quoted sequence number is
+/// the one its SYN carried.
+#[derive(Clone, Copy)]
+enum Quote {
+    Udp,
+    /// The guest's SYN, by its sequence number.
+    TcpSyn(u32),
+}
+
 /// UDP GSO segment size for a super-frame of `total` payload bytes
 /// resegmented at `seg`; single-datagram frames carry no GSO metadata.
 fn gso_of(total: usize, seg: usize) -> Option<u16> {
@@ -1663,4 +1834,31 @@ fn ping_socket(dst: IpAddr) -> Option<UdpSocket> {
     )
     .ok()?;
     Some(UdpSocket::from(fd))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SynAnswer, syn_answer};
+
+    /// Errors no network namespace setup provokes reliably; the
+    /// routing, policy and port-shortage cases run end to end in
+    /// `tests/connect_errors.rs`.
+    #[test]
+    fn syn_answers_by_error_class() {
+        for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::EAGAIN,
+        ] {
+            assert_eq!(syn_answer(errno), SynAnswer::Retransmit, "errno {errno}");
+        }
+        assert_eq!(syn_answer(libc::EPERM), syn_answer(libc::EACCES));
+        assert_eq!(
+            syn_answer(libc::EAFNOSUPPORT),
+            syn_answer(libc::ENETUNREACH)
+        );
+        assert_eq!(syn_answer(libc::EINVAL), SynAnswer::Reset);
+    }
 }

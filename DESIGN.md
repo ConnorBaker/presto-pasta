@@ -44,6 +44,22 @@ a built-in seccomp filter is an optional feature.
 ## Scope
 
 - outbound TCP and UDP, per-flow connected host sockets
+- a guest connection the host cannot make fails at once, the way the
+  host socket failed: ICMP/ICMPv6 destination unreachable for routing
+  errors, and for connects a firewall or LSM refused or UDP ones to a
+  broadcast address on the host, which needs `SO_BROADCAST`
+  (administratively prohibited); an RST for a refused TCP connect and
+  any other TCP failure. A failure that passes (out of fds, memory,
+  buffers or local ports, as `socket()` or `connect()` report it at
+  once) gets no answer, and the guest's retransmit retries; UDP's
+  other failures get none either. Guest UDP sockets see net or host
+  unreachable only with `IP_RECVERR`/`IPV6_RECVERR`: Linux treats
+  those as soft errors, and only port unreachable and administratively
+  prohibited fail a connected UDP socket without it. No SYN or datagram
+  to a multicast or broadcast address, IPv4-mapped ones included, gets
+  an answer (RFC 1122 3.2.2, 4.2.3.10).
+  These answers are not rate-limited, as pasta's ICMP errors to its
+  guest are not: each answers one packet the guest sent
 - ICMP/ICMPv6 echo via ping sockets; if `net.ipv4.ping_group_range`
   excludes the caller's gid, echo is disabled instead of failing
 - DNS forwarding: queries to the gateway address go to the host

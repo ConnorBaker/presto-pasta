@@ -35,14 +35,19 @@
           version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
-          # The netns integration tests need nested user namespaces and
-          # /dev/net/tun, which the Nix build sandbox does not provide;
-          # run them from the dev shell instead.
+          # The netns integration tests need /dev/net/tun, which the Nix
+          # build sandbox does not provide; run them from the dev shell
+          # instead.
           checkFlags = [
             "--skip=datapath"
             "--skip=flow_filter"
             "--skip=lossy_download"
           ];
+          # tests/connect_errors.rs needs no /dev/net/tun: it makes its
+          # own user and network namespaces, set up with ip, and runs here
+          # where the builder allows unprivileged user namespaces (it
+          # skips, and says so, where it does not).
+          nativeCheckInputs = [ pkgs.iproute2 ];
         };
 
         # QUIC throughput tool (iperf-like, quicly based) used by the
