@@ -43,10 +43,11 @@
             "--skip=flow_filter"
             "--skip=lossy_download"
           ];
-          # tests/connect_errors.rs needs no /dev/net/tun: it makes its
-          # own user and network namespaces, set up with ip, and runs here
-          # where the builder allows unprivileged user namespaces (it
-          # skips, and says so, where it does not).
+          # tests/connect_errors.rs and tests/ipv6_probe.rs need no
+          # /dev/net/tun: they make their own user and network namespaces,
+          # set up with ip, and run here where the builder allows
+          # unprivileged user namespaces (they skip, and say so, where it
+          # does not).
           nativeCheckInputs = [ pkgs.iproute2 ];
         };
 

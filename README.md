@@ -77,7 +77,9 @@ the namespace and tap setup.
 Outbound TCP, UDP and ICMP/ICMPv6 echo with per-flow connected host
 sockets, plus DNS forwarding to the host resolver. NAT64 carries the
 guest's IPv4 traffic on IPv6-only hosts (`Config::nat64_prefix`, with
-DNS64 prefix discovery). Inbound port
+DNS64 prefix discovery). Where the host has no IPv6 default route its
+connects can use, the caller can leave the guest without IPv6
+(`Config::ipv6`, `netdev::host_has_ipv6_default_route`). Inbound port
 forwarding, DHCP/RA, ARP/NDP responders and pasta's other modes are
 out of scope. Architecture: [DESIGN.md](DESIGN.md).
 
