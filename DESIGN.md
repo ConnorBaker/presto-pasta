@@ -62,9 +62,11 @@ a built-in seccomp filter is an optional feature.
   address or the limited broadcast address, IPv4-mapped ones included,
   gets an answer, and no ICMP error is sent about a packet to one (RFC
   1122 3.2.2, 4.2.3.10). A UDP GSO frame is one packet: it gets one
-  answer, however many segments it carries. The answers need no pool
-  buffer, and they are not rate-limited: each answers one packet the
-  guest sent
+  answer, however many segments it carries. A TCP or UDP flow the
+  caller's policy (`Config::allow_flow`) refuses is answered as a host
+  connect a firewall refused is: administratively prohibited. The
+  answers need no pool buffer, and they are not rate-limited: each
+  answers one packet the guest sent
 - ICMP/ICMPv6 echo via ping sockets; if `net.ipv4.ping_group_range`
   excludes the caller's gid, echo is disabled instead of failing
 - DNS forwarding: queries to the gateway address go to the host
