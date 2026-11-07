@@ -44,18 +44,27 @@ a built-in seccomp filter is an optional feature.
 ## Scope
 
 - outbound TCP and UDP, per-flow connected host sockets
-- a guest TCP connection the host cannot make fails at once, the way
-  the host socket failed: ICMP/ICMPv6 destination unreachable for
-  routing errors and for connects a firewall or LSM refused
-  (administratively prohibited); an RST for a refused connect and any
-  other failure, `EADDRNOTAVAIL` among them (a host out of local ports,
-  or an IPv6 one without a source address). A failure that passes (out
-  of fds, memory or buffers, as `socket()` or `connect()` report it at
-  once) gets no answer, and the guest's retransmit retries. No SYN to a
-  multicast address or the limited broadcast address, IPv4-mapped ones
-  included, gets an answer, and no ICMP error is sent about a packet to
-  one (RFC 1122 3.2.2, 4.2.3.10). The answers need no pool buffer, and
-  they are not rate-limited: each answers one packet the guest sent
+- a guest connection the host cannot make fails at once, the way the
+  host socket failed: ICMP/ICMPv6 destination unreachable for routing
+  errors, and for connects a firewall or LSM refused or UDP ones to a
+  subnet broadcast address of one of the host's networks, which needs
+  `SO_BROADCAST` (administratively prohibited); an RST for a refused
+  TCP connect and any other TCP failure, `EADDRNOTAVAIL` among them (a
+  host out of local ports, or an IPv6 one without a source address). A
+  TCP failure that passes (out of fds, memory or buffers, as `socket()`
+  or `connect()` report it at once) gets no answer, and the guest's
+  retransmit retries. A UDP connect's `EADDRNOTAVAIL` (the socket is
+  bound first, so it means no source address) is answered as no route;
+  UDP's other failures get no answer. Guest UDP sockets see net or host
+  unreachable only with `IP_RECVERR`/`IPV6_RECVERR`: Linux treats those
+  as soft errors, and of the codes sent here only port unreachable and
+  administratively prohibited fail a connected UDP socket without it. No SYN or datagram to a multicast
+  address or the limited broadcast address, IPv4-mapped ones included,
+  gets an answer, and no ICMP error is sent about a packet to one (RFC
+  1122 3.2.2, 4.2.3.10). A UDP GSO frame is one packet: it gets one
+  answer, however many segments it carries. The answers need no pool
+  buffer, and they are not rate-limited: each answers one packet the
+  guest sent
 - ICMP/ICMPv6 echo via ping sockets; if `net.ipv4.ping_group_range`
   excludes the caller's gid, echo is disabled instead of failing
 - DNS forwarding: queries to the gateway address go to the host
